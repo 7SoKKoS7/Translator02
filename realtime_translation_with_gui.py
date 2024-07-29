@@ -1,36 +1,23 @@
 import pyaudio
+import numpy as np
 import tkinter as tk
 from tkinter import ttk
 import threading
 import queue
+import sounddevice as sd
+import soundfile as sf
 import os
-import logging
-from google.cloud import speech_v1p1beta1 as speech
-from google.oauth2 import service_account
-from google.auth.exceptions import DefaultCredentialsError
 from dotenv import load_dotenv
+from google.cloud import speech
+from google.oauth2 import service_account
+import logging
 
-# Загрузка переменных окружения из файла .env
-load_dotenv()
-
-# Инициализация логирования
+# Очистка лог-файла при запуске
 with open("app.log", "w", encoding="utf-8") as log_file:
     log_file.write("")
 
-logging.basicConfig(filename="app.log", level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s",
-                    encoding="utf-8")
-
-# Загрузка учетных данных из переменной окружения
-try:
-    credentials_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
-    print(f"Path to Google credentials: {credentials_path}")
-    if not credentials_path:
-        raise ValueError("Path to Google credentials not found in environment variables.")
-    credentials = service_account.Credentials.from_service_account_file(credentials_path)
-    client = speech.SpeechClient(credentials=credentials)
-except (DefaultCredentialsError, ValueError) as e:
-    logging.error(f"Google credentials error: {e}")
-    raise
+# Настройка логирования с кодировкой utf-8
+logging.basicConfig(filename="app.log", level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s", encoding="utf-8")
 
 # Параметры аудио
 FORMAT = pyaudio.paInt16
@@ -42,69 +29,85 @@ CHUNK = 1024
 audio = pyaudio.PyAudio()
 
 # Буферы для аудио данных
-recording_buffer = queue.Queue()
+recording_buffer = []
+playback_queue = queue.Queue()
 
 # Флаги для управления потоками
 recording = threading.Event()
+playing = threading.Event()
+
+# Загрузка переменных окружения из файла .env
+load_dotenv()
+credentials_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+print(f"Path to Google credentials: {credentials_path}")
+
+# Инициализация клиента Google Cloud Speech-to-Text
+credentials = service_account.Credentials.from_service_account_file(credentials_path)
+client = speech.SpeechClient(credentials=credentials)
 
 # Конфигурация распознавания
-language_code = "ru-RU"
-last_transcript = ""
+config = speech.RecognitionConfig(
+    encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
+    sample_rate_hertz=RATE,
+    language_code="ru-RU",
+    enable_automatic_punctuation=True
+)
 
+streaming_config = speech.StreamingRecognitionConfig(config=config, interim_results=True)
 
-# Функция записи аудио
-def record_audio():
-    stream = audio.open(format=FORMAT, channels=CHANNELS, rate=RATE, input=True, frames_per_buffer=CHUNK)
-    audio_generator = (stream.read(CHUNK) for _ in iter(int, 1))
+def audio_generator():
+    while recording.is_set():
+        data = recording_buffer.pop(0) if recording_buffer else None
+        if data:
+            yield speech.StreamingRecognizeRequest(audio_content=data)
 
-    config = speech.RecognitionConfig(encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16, sample_rate_hertz=RATE,
-                                      language_code=language_code)
-    streaming_config = speech.StreamingRecognitionConfig(config=config, interim_results=True)
-
-    try:
-        requests = (speech.StreamingRecognizeRequest(audio_content=content) for content in audio_generator)
-        responses = client.streaming_recognize(streaming_config, requests)
-
-        for response in responses:
-            process_responses(response)
-    except Exception as e:
-        logging.error(f"Error during streaming recognition: {e}")
-    finally:
-        stream.stop_stream()
-        stream.close()
-
-
-def process_responses(response):
-    global last_transcript
-    for result in response.results:
-        if not result.is_final:
+def process_responses(responses):
+    global translation_text
+    for response in responses:
+        if not response.results:
             continue
-        transcript = result.alternatives[0].transcript
-        if transcript != last_transcript:
-            last_transcript = transcript
-            update_text(transcript)
-            logging.info(f"Распознанный текст: {transcript}")
 
+        result = response.results[0]
+        if result.is_final:
+            final_transcript = result.alternatives[0].transcript
+            translation_text.config(state=tk.NORMAL)
+            translation_text.insert(tk.END, final_transcript + "\n")
+            translation_text.config(state=tk.DISABLED)
+            logging.info(f"Распознанный текст (конечный): {final_transcript}")
+        else:
+            interim_transcript = result.alternatives[0].transcript
+            translation_text.config(state=tk.NORMAL)
+            translation_text.delete("1.0", tk.END)
+            translation_text.insert(tk.END, interim_transcript + "\n")
+            translation_text.config(state=tk.DISABLED)
+            logging.info(f"Распознанный текст (промежуточный): {interim_transcript}")
 
-def update_text(text):
-    translation_text.config(state=tk.NORMAL)
-    translation_text.insert(tk.END, text + "\n")
-    translation_text.config(state=tk.DISABLED)
+def record_audio():
+    stream = audio.open(format=FORMAT, channels=CHANNELS,
+                        rate=RATE, input=True,
+                        frames_per_buffer=CHUNK)
+    while recording.is_set():
+        data = stream.read(CHUNK)
+        recording_buffer.append(data)
+        if playing.is_set():
+            playback_queue.put(data)
+    stream.stop_stream()
+    stream.close()
 
-
-# Функция для запуска записи аудио
 def start_recording():
     translation_text.config(state=tk.NORMAL)
     translation_text.delete(1.0, tk.END)
     translation_text.config(state=tk.DISABLED)
     recording.set()
     threading.Thread(target=record_audio, daemon=True).start()
+    threading.Thread(target=streaming_recognize, daemon=True).start()
 
-
-# Функция для остановки записи аудио
 def stop_recording():
     recording.clear()
 
+def streaming_recognize():
+    responses = client.streaming_recognize(streaming_config, audio_generator())
+    process_responses(responses)
 
 # Инициализация GUI
 root = tk.Tk()
