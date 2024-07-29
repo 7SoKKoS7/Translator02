@@ -1,10 +1,8 @@
 google-cloud-speech==2.16.1
 google-cloud-storage==2.10.0
-pyaudio
-numpy
-tk
-threading
-queue
-sounddevice
-soundfile
 python-dotenv
+pyaudio==0.2.14
+numpy==1.26.4
+sounddevice==0.4.3
+soundfile==0.10.3.post1
+tk==0.1.0
