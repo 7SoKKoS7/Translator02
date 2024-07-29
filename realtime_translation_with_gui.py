@@ -9,6 +9,12 @@ import soundfile as sf
 import os
 import speech_recognition as sr
 import logging
+from google.cloud import speech
+from google.oauth2 import service_account
+from dotenv import load_dotenv
+
+# Загрузка переменных окружения
+load_dotenv()
 
 # Очистка лог-файла при запуске
 with open("app.log", "w", encoding="utf-8") as log_file:
@@ -27,7 +33,7 @@ CHUNK = 1024
 audio = pyaudio.PyAudio()
 
 # Буферы для аудио данных
-recording_buffer = []
+recording_buffer = queue.Queue()
 playback_queue = queue.Queue()
 
 # Флаги для управления потоками
@@ -36,14 +42,52 @@ playing = threading.Event()
 
 recognizer = sr.Recognizer()
 
+# Инициализация клиента для Google Cloud Speech
+google_credentials_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+credentials = service_account.Credentials.from_service_account_file(google_credentials_path)
+client = speech.SpeechClient(credentials=credentials)
+
+# Функция для потокового распознавания речи
+def stream_recognize():
+    global translation_text
+    streaming_config = speech.StreamingRecognitionConfig(
+        config=speech.RecognitionConfig(
+            encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
+            sample_rate_hertz=RATE,
+            language_code=language_var.get(),
+        ),
+        interim_results=True,
+    )
+
+    def requests_generator():
+        while recording.is_set():
+            if not recording_buffer.empty():
+                data = recording_buffer.get()
+                yield speech.StreamingRecognizeRequest(audio_content=data)
+
+    requests = requests_generator()
+    responses = client.streaming_recognize(streaming_config, requests)
+
+    for response in responses:
+        for result in response.results:
+            if result.is_final:
+                logging.info(f"Распознанный текст: {result.alternatives[0].transcript}")
+                translation_text.config(state=tk.NORMAL)
+                translation_text.insert(tk.END, result.alternatives[0].transcript + "\n")
+                translation_text.config(state=tk.DISABLED)
+            else:
+                logging.info(f"Промежуточный результат: {result.alternatives[0].transcript}")
+                translation_text.config(state=tk.NORMAL)
+                translation_text.delete('1.0', tk.END)
+                translation_text.insert(tk.END, result.alternatives[0].transcript)
+                translation_text.config(state=tk.DISABLED)
+
 # Функция записи аудио
 def record_audio():
-    stream = audio.open(format=FORMAT, channels=CHANNELS,
-                        rate=RATE, input=True,
-                        frames_per_buffer=CHUNK)
+    stream = audio.open(format=FORMAT, channels=CHANNELS, rate=RATE, input=True, frames_per_buffer=CHUNK)
     while recording.is_set():
         data = stream.read(CHUNK)
-        recording_buffer.append(data)
+        recording_buffer.put(data)
         if playing.is_set():
             playback_queue.put(data)
     stream.stop_stream()
@@ -51,38 +95,13 @@ def record_audio():
 
 # Функция воспроизведения аудио
 def play_audio():
-    stream = audio.open(format=FORMAT, channels=CHANNELS,
-                        rate=RATE, output=True)
+    stream = audio.open(format=FORMAT, channels=CHANNELS, rate=RATE, output=True)
     while playing.is_set():
         if not playback_queue.empty():
             data = playback_queue.get()
             stream.write(data)
     stream.stop_stream()
     stream.close()
-
-# Функция преобразования аудио в текст
-def transcribe_audio():
-    global translation_text
-    audio_data = np.frombuffer(b''.join(recording_buffer), dtype=np.int16)
-    sf.write("temp.wav", audio_data, RATE)
-    with sr.AudioFile("temp.wav") as source:
-        audio = recognizer.record(source)
-        try:
-            text = recognizer.recognize_google(audio, language=language_var.get())
-            translation_text.config(state=tk.NORMAL)
-            translation_text.insert(tk.END, text + "\n")
-            translation_text.config(state=tk.DISABLED)
-            logging.info(f"Распознанный текст: {text}")
-        except sr.UnknownValueError:
-            translation_text.config(state=tk.NORMAL)
-            translation_text.insert(tk.END, "[Не удалось распознать речь]\n")
-            translation_text.config(state=tk.DISABLED)
-            logging.info("Не удалось распознать речь")
-        except sr.RequestError as e:
-            translation_text.config(state=tk.NORMAL)
-            translation_text.insert(tk.END, "[Ошибка сервиса распознавания]\n")
-            translation_text.config(state=tk.DISABLED)
-            logging.error(f"Ошибка сервиса распознавания: {e}")
 
 # Запуск записи аудио
 def start_recording():
@@ -91,17 +110,17 @@ def start_recording():
     translation_text.config(state=tk.DISABLED)
     recording.set()
     threading.Thread(target=record_audio, daemon=True).start()
+    threading.Thread(target=stream_recognize, daemon=True).start()
 
 # Остановка записи аудио
 def stop_recording():
     recording.clear()
-    transcribe_audio()
 
 # Запуск воспроизведения аудио
 def start_playing():
     playback_queue.queue.clear()  # Очистка очереди перед воспроизведением
-    for data in recording_buffer:
-        playback_queue.put(data)
+    while not recording_buffer.empty():
+        playback_queue.put(recording_buffer.get())
     playing.set()
     threading.Thread(target=play_audio, daemon=True).start()
 

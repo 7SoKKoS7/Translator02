@@ -1,7 +1,10 @@
+google-cloud-speech==2.16.1
+google-cloud-storage==2.10.0
 pyaudio
 numpy
 tk
-google-cloud-speech
+threading
+queue
 sounddevice
 soundfile
 python-dotenv
