@@ -1,0 +1,7 @@
+pyaudio
+numpy
+tk
+google-cloud-speech
+sounddevice
+soundfile
+python-dotenv
